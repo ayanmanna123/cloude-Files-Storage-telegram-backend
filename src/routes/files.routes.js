@@ -11,6 +11,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 router.use(protect);
 
 router.post('/upload', upload.single('file'), filesController.uploadFile);
+router.post('/upload-chunk', upload.single('file'), filesController.uploadChunk);
 router.get('/:id/raw', filesController.streamRawFile);
 router.post('/init', filesController.initFileUpload);
 router.post('/complete', filesController.completeFileUpload);

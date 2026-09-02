@@ -315,6 +315,218 @@ exports.initFileUpload = async (req, res, next) => {
   }
 };
 
+const saveFileBufferToTelegramAndDb = async ({
+  fileBuffer,
+  fileName,
+  mimeType,
+  rawFolderId,
+  targetFileId,
+  isEncrypted,
+  encryptionIv,
+  sourceDevice,
+  isDeviceSync,
+  userId
+}) => {
+  let targetFolderId = (rawFolderId && rawFolderId !== 'null' && rawFolderId !== 'undefined') ? rawFolderId : null;
+  let fileOwnerId = userId;
+
+  // If device sync upload and no explicit folder specified, find/create Mobile Uploads or Laptop Uploads folder
+  if (!targetFolderId && (isDeviceSync || (sourceDevice && sourceDevice !== 'unknown'))) {
+    const deviceType = (sourceDevice || 'laptop').toLowerCase();
+    const folderName = deviceType === 'mobile' ? 'Mobile Uploads' : 'Laptop Uploads';
+
+    try {
+      const { data: existingFolder } = await supabase
+        .from('folders')
+        .select('id')
+        .eq('owner_id', fileOwnerId)
+        .eq('name', folderName)
+        .is('parent_id', null)
+        .eq('is_deleted', false)
+        .maybeSingle();
+
+      if (existingFolder) {
+        targetFolderId = existingFolder.id;
+      } else {
+        const { data: createdFolder } = await supabase
+          .from('folders')
+          .insert([{
+            name: folderName,
+            owner_id: fileOwnerId,
+            parent_id: null
+          }])
+          .select('id')
+          .single();
+
+        if (createdFolder) {
+          targetFolderId = createdFolder.id;
+        }
+      }
+    } catch (folderErr) {
+      console.error("Error auto-creating device sync folder:", folderErr);
+    }
+  }
+
+  if (targetFolderId) {
+    const folderRole = await getFolderShareRole(targetFolderId, userId);
+    if (folderRole && folderRole !== 'owner' && folderRole !== 'editor') {
+      throw new AppError('Unauthorized to edit this folder', ERROR_CODES.FORBIDDEN.status, ERROR_CODES.FORBIDDEN.code);
+    }
+    const { data: parentFolder } = await supabase
+      .from('folders')
+      .select('owner_id')
+      .eq('id', targetFolderId)
+      .single();
+    if (parentFolder) {
+      fileOwnerId = parentFolder.owner_id;
+    }
+  }
+
+  let existingFile = null;
+  if (targetFileId) {
+    const { data: fileData } = await supabase
+      .from('files')
+      .select('id, name, owner_id, storage_key')
+      .eq('id', targetFileId)
+      .eq('is_deleted', false)
+      .single();
+
+    if (fileData) {
+      const isEditor = await checkFileEditor(targetFileId, userId);
+      if (isEditor) {
+        existingFile = fileData;
+      } else {
+        throw new AppError('Unauthorized to edit this file', ERROR_CODES.FORBIDDEN.status, ERROR_CODES.FORBIDDEN.code);
+      }
+    }
+  } else {
+    let query = supabase
+      .from('files')
+      .select('id, name, owner_id, storage_key')
+      .eq('owner_id', fileOwnerId)
+      .eq('name', fileName)
+      .eq('is_deleted', false);
+
+    if (targetFolderId) query = query.eq('folder_id', targetFolderId);
+    else query = query.is('folder_id', null);
+
+    const { data: existingFiles } = await query.limit(1);
+    existingFile = existingFiles && existingFiles.length > 0 ? existingFiles[0] : null;
+  }
+
+  const { fileId: telegramFileId, messageId: telegramMessageId, fileSize } = await uploadToTelegram(
+    fileBuffer,
+    fileName,
+    mimeType || 'application/octet-stream'
+  );
+
+  const storageKey = `tg:${telegramFileId}:${telegramMessageId}`;
+  const existingFileId = existingFile ? existingFile.id : null;
+  let fileId;
+  let isNewVersion = false;
+
+  if (existingFileId) {
+    fileId = existingFileId;
+    isNewVersion = true;
+
+    const { data: versions } = await supabase
+      .from('file_versions')
+      .select('version_number')
+      .eq('file_id', existingFileId)
+      .order('version_number', { ascending: false });
+
+    const hasVersion1 = (versions || []).some(v => v.version_number === 1);
+    if (!hasVersion1) {
+      await supabase.from('file_versions').insert([{
+        file_id: existingFileId,
+        version_number: 1,
+        storage_key: existingFile.storage_key,
+        size_bytes: fileBuffer.length,
+        created_at: new Date().toISOString()
+      }]);
+    }
+
+    const maxVer = (versions && versions.length > 0) ? Math.max(...versions.map(v => v.version_number)) : 1;
+    const nextVersion = maxVer + 1;
+
+    const { data: newVersion } = await supabase
+      .from('file_versions')
+      .insert([{
+        file_id: existingFileId,
+        version_number: nextVersion,
+        storage_key: storageKey,
+        size_bytes: fileSize || fileBuffer.length,
+      }])
+      .select('id')
+      .single();
+
+    const updates = {
+      storage_key: storageKey,
+      size_bytes: fileSize || fileBuffer.length,
+      mime_type: mimeType || 'application/octet-stream',
+      updated_at: new Date().toISOString()
+    };
+    if (newVersion) updates.version_id = newVersion.id;
+    if (isEncrypted !== undefined) updates.is_encrypted = isEncrypted;
+    if (encryptionIv) updates.encryption_iv = encryptionIv;
+
+    await supabase.from('files').update(updates).eq('id', existingFileId);
+
+  } else {
+    const insertPayload = {
+      name: fileName,
+      mime_type: mimeType || 'application/octet-stream',
+      size_bytes: fileSize || fileBuffer.length,
+      storage_key: storageKey,
+      owner_id: fileOwnerId,
+      folder_id: targetFolderId,
+      is_encrypted: isEncrypted,
+      encryption_iv: encryptionIv || null,
+      source_device: sourceDevice || null,
+      is_device_sync: isDeviceSync,
+    };
+
+    let { data: newFile, error } = await supabase
+      .from('files')
+      .insert([insertPayload])
+      .select()
+      .single();
+
+    if (error && (error.message.includes('is_encrypted') || error.message.includes('column'))) {
+      delete insertPayload.is_encrypted;
+      delete insertPayload.encryption_iv;
+      delete insertPayload.source_device;
+      delete insertPayload.is_device_sync;
+      const retry = await supabase.from('files').insert([insertPayload]).select().single();
+      newFile = retry.data;
+      error = retry.error;
+    }
+
+    if (error) {
+      throw new AppError(error.message, ERROR_CODES.INTERNAL_SERVER_ERROR.status, ERROR_CODES.INTERNAL_SERVER_ERROR.code);
+    }
+
+    fileId = newFile.id;
+
+    await supabase.from('file_versions').insert([{
+      file_id: fileId,
+      version_number: 1,
+      storage_key: storageKey,
+      size_bytes: fileSize || fileBuffer.length,
+    }]);
+  }
+
+  const { data: updatedFile } = await supabase.from('files').select('*').eq('id', fileId).single();
+
+  return {
+    status: 'success',
+    fileId,
+    storageKey,
+    isNewVersion,
+    file: keysToCamel(updatedFile)
+  };
+};
+
 exports.uploadFile = async (req, res, next) => {
   try {
     if (!req.file) {
@@ -332,208 +544,124 @@ exports.uploadFile = async (req, res, next) => {
     } = req.body;
 
     const fileName = bodyName || req.file.originalname;
+    const mimeType = req.file.mimetype || 'application/octet-stream';
     const isEncrypted = rawIsEncrypted === 'true' || rawIsEncrypted === true;
     const isDeviceSync = rawIsDeviceSync === 'true' || rawIsDeviceSync === true;
-    let targetFolderId = (rawFolderId && rawFolderId !== 'null' && rawFolderId !== 'undefined') ? rawFolderId : null;
 
-    let fileOwnerId = req.user.id;
-
-    // If device sync upload and no explicit folder specified, find/create Mobile Uploads or Laptop Uploads folder
-    if (!targetFolderId && (isDeviceSync || (sourceDevice && sourceDevice !== 'unknown'))) {
-      const deviceType = (sourceDevice || 'laptop').toLowerCase();
-      const folderName = deviceType === 'mobile' ? 'Mobile Uploads' : 'Laptop Uploads';
-
-      try {
-        const { data: existingFolder } = await supabase
-          .from('folders')
-          .select('id')
-          .eq('owner_id', fileOwnerId)
-          .eq('name', folderName)
-          .is('parent_id', null)
-          .eq('is_deleted', false)
-          .maybeSingle();
-
-        if (existingFolder) {
-          targetFolderId = existingFolder.id;
-        } else {
-          const { data: createdFolder } = await supabase
-            .from('folders')
-            .insert([{
-              name: folderName,
-              owner_id: fileOwnerId,
-              parent_id: null
-            }])
-            .select('id')
-            .single();
-
-          if (createdFolder) {
-            targetFolderId = createdFolder.id;
-          }
-        }
-      } catch (folderErr) {
-        console.error("Error auto-creating device sync folder in uploadFile:", folderErr);
-      }
-    }
-
-    if (targetFolderId) {
-      const folderRole = await getFolderShareRole(targetFolderId, req.user.id);
-      if (folderRole && folderRole !== 'owner' && folderRole !== 'editor') {
-        throw new AppError('Unauthorized to edit this folder', ERROR_CODES.FORBIDDEN.status, ERROR_CODES.FORBIDDEN.code);
-      }
-      const { data: parentFolder } = await supabase
-        .from('folders')
-        .select('owner_id')
-        .eq('id', targetFolderId)
-        .single();
-      if (parentFolder) {
-        fileOwnerId = parentFolder.owner_id;
-      }
-    }
-
-    let existingFile = null;
-    if (targetFileId) {
-      const { data: fileData } = await supabase
-        .from('files')
-        .select('id, name, owner_id, storage_key')
-        .eq('id', targetFileId)
-        .eq('is_deleted', false)
-        .single();
-
-      if (fileData) {
-        const isEditor = await checkFileEditor(targetFileId, req.user.id);
-        if (isEditor) {
-          existingFile = fileData;
-        } else {
-          throw new AppError('Unauthorized to edit this file', ERROR_CODES.FORBIDDEN.status, ERROR_CODES.FORBIDDEN.code);
-        }
-      }
-    } else {
-      let query = supabase
-        .from('files')
-        .select('id, name, owner_id, storage_key')
-        .eq('owner_id', fileOwnerId)
-        .eq('name', fileName)
-        .eq('is_deleted', false);
-
-      if (targetFolderId) query = query.eq('folder_id', targetFolderId);
-      else query = query.is('folder_id', null);
-
-      const { data: existingFiles } = await query.limit(1);
-      existingFile = existingFiles && existingFiles.length > 0 ? existingFiles[0] : null;
-    }
-
-    const mimeType = req.file.mimetype || 'application/octet-stream';
-    const { fileId: telegramFileId, messageId: telegramMessageId, fileSize } = await uploadToTelegram(
-      req.file.buffer,
+    const result = await saveFileBufferToTelegramAndDb({
+      fileBuffer: req.file.buffer,
       fileName,
-      mimeType
-    );
+      mimeType,
+      rawFolderId,
+      targetFileId,
+      isEncrypted,
+      encryptionIv,
+      sourceDevice,
+      isDeviceSync,
+      userId: req.user.id
+    });
 
-    const storageKey = `tg:${telegramFileId}:${telegramMessageId}`;
-    const existingFileId = existingFile ? existingFile.id : null;
-    let fileId;
-    let isNewVersion = false;
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
 
-    if (existingFileId) {
-      fileId = existingFileId;
-      isNewVersion = true;
+// In-memory chunk storage session map
+const chunkSessions = new Map();
 
-      const { data: versions } = await supabase
-        .from('file_versions')
-        .select('version_number')
-        .eq('file_id', existingFileId)
-        .order('version_number', { ascending: false });
+// Periodic cleanup of orphaned upload sessions (>30 min old)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of chunkSessions.entries()) {
+    if (now - session.createdAt > 30 * 60 * 1000) {
+      chunkSessions.delete(id);
+    }
+  }
+}, 10 * 60 * 1000);
 
-      const hasVersion1 = (versions || []).some(v => v.version_number === 1);
-      if (!hasVersion1) {
-        await supabase.from('file_versions').insert([{
-          file_id: existingFileId,
-          version_number: 1,
-          storage_key: existingFile.storage_key,
-          size_bytes: req.file.size,
-          created_at: new Date().toISOString()
-        }]);
-      }
-
-      const maxVer = (versions && versions.length > 0) ? Math.max(...versions.map(v => v.version_number)) : 1;
-      const nextVersion = maxVer + 1;
-
-      const { data: newVersion } = await supabase
-        .from('file_versions')
-        .insert([{
-          file_id: existingFileId,
-          version_number: nextVersion,
-          storage_key: storageKey,
-          size_bytes: fileSize || req.file.size,
-        }])
-        .select('id')
-        .single();
-
-      const updates = {
-        storage_key: storageKey,
-        size_bytes: fileSize || req.file.size,
-        mime_type: mimeType,
-        updated_at: new Date().toISOString()
-      };
-      if (newVersion) updates.version_id = newVersion.id;
-      if (isEncrypted !== undefined) updates.is_encrypted = isEncrypted;
-      if (encryptionIv) updates.encryption_iv = encryptionIv;
-
-      await supabase.from('files').update(updates).eq('id', existingFileId);
-
-    } else {
-      const insertPayload = {
-        name: fileName,
-        mime_type: mimeType,
-        size_bytes: fileSize || req.file.size,
-        storage_key: storageKey,
-        owner_id: fileOwnerId,
-        folder_id: targetFolderId,
-        is_encrypted: isEncrypted,
-        encryption_iv: encryptionIv || null,
-        source_device: sourceDevice || null,
-        is_device_sync: isDeviceSync,
-      };
-
-      let { data: newFile, error } = await supabase
-        .from('files')
-        .insert([insertPayload])
-        .select()
-        .single();
-
-      if (error && (error.message.includes('is_encrypted') || error.message.includes('column'))) {
-        delete insertPayload.is_encrypted;
-        delete insertPayload.encryption_iv;
-        delete insertPayload.source_device;
-        delete insertPayload.is_device_sync;
-        const retry = await supabase.from('files').insert([insertPayload]).select().single();
-        newFile = retry.data;
-        error = retry.error;
-      }
-
-      if (error) {
-        throw new AppError(error.message, ERROR_CODES.INTERNAL_SERVER_ERROR.status, ERROR_CODES.INTERNAL_SERVER_ERROR.code);
-      }
-
-      fileId = newFile.id;
-
-      await supabase.from('file_versions').insert([{
-        file_id: fileId,
-        version_number: 1,
-        storage_key: storageKey,
-        size_bytes: fileSize || req.file.size,
-      }]);
+exports.uploadChunk = async (req, res, next) => {
+  try {
+    if (!req.file) {
+      throw new AppError('No chunk buffer provided', ERROR_CODES.BAD_REQUEST.status, ERROR_CODES.BAD_REQUEST.code);
     }
 
-    const { data: updatedFile } = await supabase.from('files').select('*').eq('id', fileId).single();
+    const {
+      uploadId,
+      chunkIndex: rawIndex,
+      totalChunks: rawTotal,
+      name: bodyName,
+      folderId: rawFolderId,
+      targetFileId,
+      isEncrypted: rawIsEncrypted,
+      encryptionIv,
+      sourceDevice,
+      isDeviceSync: rawIsDeviceSync,
+      mimeType: rawMimeType
+    } = req.body;
 
-    res.status(200).json({
-      status: 'success',
-      fileId,
-      storageKey,
-      isNewVersion,
-      file: keysToCamel(updatedFile)
+    if (!uploadId || rawIndex === undefined || !rawTotal) {
+      throw new AppError('Missing chunk metadata', ERROR_CODES.BAD_REQUEST.status, ERROR_CODES.BAD_REQUEST.code);
+    }
+
+    const chunkIndex = Number(rawIndex);
+    const totalChunks = Number(rawTotal);
+
+    let session = chunkSessions.get(uploadId);
+    if (!session) {
+      session = {
+        chunks: new Map(),
+        totalChunks,
+        createdAt: Date.now()
+      };
+      chunkSessions.set(uploadId, session);
+    }
+
+    session.chunks.set(chunkIndex, req.file.buffer);
+
+    // If not all chunks received yet
+    if (session.chunks.size < totalChunks) {
+      return res.status(200).json({
+        status: 'chunk_received',
+        uploadId,
+        chunkIndex,
+        totalChunks,
+        receivedChunks: session.chunks.size
+      });
+    }
+
+    // All chunks received! Reassemble file buffer in sequential order
+    const orderedBuffers = [];
+    for (let i = 0; i < totalChunks; i++) {
+      const buf = session.chunks.get(i);
+      if (!buf) {
+        throw new AppError(`Missing chunk index ${i}`, ERROR_CODES.BAD_REQUEST.status, ERROR_CODES.BAD_REQUEST.code);
+      }
+      orderedBuffers.push(buf);
+    }
+
+    const completeBuffer = Buffer.concat(orderedBuffers);
+    chunkSessions.delete(uploadId);
+
+    const fileName = bodyName || req.file.originalname || 'file';
+    const mimeType = rawMimeType || req.file.mimetype || 'application/octet-stream';
+    const isEncrypted = rawIsEncrypted === 'true' || rawIsEncrypted === true;
+    const isDeviceSync = rawIsDeviceSync === 'true' || rawIsDeviceSync === true;
+
+    const result = await saveFileBufferToTelegramAndDb({
+      fileBuffer: completeBuffer,
+      fileName,
+      mimeType,
+      rawFolderId,
+      targetFileId,
+      isEncrypted,
+      encryptionIv,
+      sourceDevice,
+      isDeviceSync,
+      userId: req.user.id
     });
+
+    res.status(200).json(result);
   } catch (error) {
     next(error);
   }
