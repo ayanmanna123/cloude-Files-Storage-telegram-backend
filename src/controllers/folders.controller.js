@@ -183,7 +183,13 @@ exports.getRoot = async (req, res, next) => {
     if (hiddenFileIds.length > 0) {
       filesQuery = filesQuery.not('id', 'in', `(${hiddenFileIds.join(',')})`);
     }
-    const { data: files } = await filesQuery;
+    const { data: rawFiles } = await filesQuery;
+
+    // Filter out device sync / device uploaded files from root directory
+    const files = (rawFiles || []).filter(f => 
+      !f.is_device_sync && 
+      (!f.source_device || f.source_device === 'unknown')
+    );
 
     res.status(200).json({
       folder: { name: 'My Drive', id: null },
