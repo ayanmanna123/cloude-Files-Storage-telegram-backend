@@ -382,7 +382,9 @@ const saveFileBufferToTelegramAndDb = async ({
     }
   }
 
+  let finalFileName = fileName;
   let existingFile = null;
+
   if (targetFileId) {
     const { data: fileData } = await supabase
       .from('files')
@@ -400,23 +402,39 @@ const saveFileBufferToTelegramAndDb = async ({
       }
     }
   } else {
+    // Check if a file with the exact same name exists in this folder to auto-unique the filename
     let query = supabase
       .from('files')
-      .select('id, name, owner_id, storage_key')
+      .select('name')
       .eq('owner_id', fileOwnerId)
-      .eq('name', fileName)
       .eq('is_deleted', false);
 
     if (targetFolderId) query = query.eq('folder_id', targetFolderId);
     else query = query.is('folder_id', null);
 
-    const { data: existingFiles } = await query.limit(1);
-    existingFile = existingFiles && existingFiles.length > 0 ? existingFiles[0] : null;
+    const { data: existingSameNameFiles } = await query;
+    if (existingSameNameFiles && existingSameNameFiles.length > 0) {
+      const nameSet = new Set(existingSameNameFiles.map(f => f.name));
+      if (nameSet.has(fileName)) {
+        const extIdx = fileName.lastIndexOf('.');
+        let base = fileName;
+        let ext = '';
+        if (extIdx > 0) {
+          base = fileName.substring(0, extIdx);
+          ext = fileName.substring(extIdx);
+        }
+        let counter = 1;
+        while (nameSet.has(`${base} (${counter})${ext}`)) {
+          counter++;
+        }
+        finalFileName = `${base} (${counter})${ext}`;
+      }
+    }
   }
 
   const { fileId: telegramFileId, messageId: telegramMessageId, fileSize } = await uploadToTelegram(
     fileBuffer,
-    fileName,
+    finalFileName,
     mimeType || 'application/octet-stream'
   );
 
@@ -474,7 +492,7 @@ const saveFileBufferToTelegramAndDb = async ({
 
   } else {
     const insertPayload = {
-      name: fileName,
+      name: finalFileName,
       mime_type: mimeType || 'application/octet-stream',
       size_bytes: fileSize || fileBuffer.length,
       storage_key: storageKey,
