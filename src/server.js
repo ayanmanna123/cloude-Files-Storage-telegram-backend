@@ -45,23 +45,19 @@ app.use(cors({
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
 
-    const cleanOrigin = origin.replace(/\/$/, '').toLowerCase();
+    const cleanOrigin = origin.replace(/\/$/, '');
     const isAllowed = 
-      allowedOrigins.some(o => o.toLowerCase() === cleanOrigin) ||
+      allowedOrigins.indexOf(cleanOrigin) !== -1 ||
       cleanOrigin.endsWith('.vercel.app') ||
-      cleanOrigin.endsWith('.workers.dev') ||
-      cleanOrigin.includes('localhost') ||
-      cleanOrigin.includes('127.0.0.1');
+      cleanOrigin.endsWith('.workers.dev');
 
     if (isAllowed) {
-      callback(null, origin);
+      callback(null, true);
     } else {
-      console.warn(`[CORS REJECTED] Origin not explicitly allowed: ${origin}`);
-      callback(null, false);
+      callback(new Error('Not allowed by CORS'));
     }
   },
-  credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin']
+  credentials: true
 })); // Enable credentials for cookies
 
 app.use(helmet({

@@ -5,6 +5,7 @@ const { protect, optionalAuth } = require('../middlewares/auth.middleware');
 const router = express.Router();
 
 // GET link is public (with optional auth for auto-saving to Shared With Me)
+router.get('/:token/raw', optionalAuth, linksController.streamPublicLinkRaw);
 router.get('/:token', optionalAuth, linksController.getLink);
 router.get('/bundle/:token', optionalAuth, linksController.getBundleShare);
 

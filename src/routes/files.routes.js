@@ -4,9 +4,14 @@ const { protect } = require('../middlewares/auth.middleware');
 
 const router = express.Router();
 
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+
 // All file routes require authentication
 router.use(protect);
 
+router.post('/upload', upload.single('file'), filesController.uploadFile);
+router.get('/:id/raw', filesController.streamRawFile);
 router.post('/init', filesController.initFileUpload);
 router.post('/complete', filesController.completeFileUpload);
 router.get('/recent', filesController.getRecentFiles);

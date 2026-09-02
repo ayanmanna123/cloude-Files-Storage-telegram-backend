@@ -1,5 +1,5 @@
 const supabase = require('../config/supabase');
-const imagekit = require('../config/imagekit');
+const { deleteFromTelegram } = require('../services/telegram.service');
 const { AppError, ERROR_CODES } = require('../utils/error');
 const { keysToCamel } = require('../utils/caseConverter');
 const { getPersonalHiddenIds } = require('../utils/hiddenItems');
@@ -165,30 +165,16 @@ const getAllFilesForFolder = async (folderId, ownerId) => {
   return filesToDelete;
 };
 
-const deleteFromImageKit = async (storageKey) => {
+const deleteStorageAsset = async (storageKey) => {
   if (!storageKey) return;
-  
   try {
-    const fileName = storageKey.split('/').pop();
-    const result = await new Promise((resolve) => {
-      imagekit.listFiles({ searchQuery: `name="${fileName}"` }, (err, res) => {
-        if (err) resolve(null);
-        else resolve(res);
-      });
-    });
-    
-    if (result && result.length > 0) {
-      // Find exact match just in case
-      const targetFile = result.find(f => f.filePath === `/${storageKey}`) || result[0];
-      await new Promise((resolve) => {
-        imagekit.deleteFile(targetFile.fileId, (err, res) => {
-          if (err) console.error("ImageKit delete error:", err);
-          resolve(res);
-        });
-      });
+    const parts = storageKey.split(':');
+    if (parts.length >= 3 && parts[0] === 'tg') {
+      const messageId = parts[2];
+      await deleteFromTelegram(messageId);
     }
   } catch (error) {
-    console.error("Error deleting from ImageKit:", error);
+    console.error("Error deleting asset from Telegram:", error);
   }
 };
 
@@ -234,9 +220,9 @@ exports.hardDeleteTrash = async (req, res, next) => {
       }
     }
     
-    // Delete from ImageKit
+    // Delete physical assets from Telegram
     for (const storageKey of allStorageKeys) {
-      await deleteFromImageKit(storageKey);
+      await deleteStorageAsset(storageKey);
     }
     
     const table = type === 'file' ? 'files' : 'folders';

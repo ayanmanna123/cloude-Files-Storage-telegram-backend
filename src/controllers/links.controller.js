@@ -1,6 +1,8 @@
 const supabase = require('../config/supabase');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { getTelegramFileStream } = require('../services/telegram.service');
+const { Readable } = require('stream');
 const { AppError, ERROR_CODES } = require('../utils/error');
 const { keysToCamel } = require('../utils/caseConverter');
 
@@ -305,6 +307,82 @@ exports.getBundleShare = async (req, res, next) => {
       files: files || [],
       savedToSharedWithMe
     }));
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.streamPublicLinkRaw = async (req, res, next) => {
+  try {
+    const { token } = req.params;
+    const { password, fileId } = req.query;
+
+    const { data: link, error } = await supabase
+      .from('link_shares')
+      .select('*')
+      .eq('token', token)
+      .single();
+
+    if (error || !link) {
+      throw new AppError('Link not found or invalid', ERROR_CODES.NOT_FOUND.status, ERROR_CODES.NOT_FOUND.code);
+    }
+
+    if (link.expires_at && new Date(link.expires_at) < new Date()) {
+      throw new AppError('This link has expired', ERROR_CODES.FORBIDDEN.status, ERROR_CODES.FORBIDDEN.code);
+    }
+
+    if (link.password_hash) {
+      if (!password) {
+        throw new AppError('Password required to access this link', ERROR_CODES.UNAUTHORIZED.status, ERROR_CODES.UNAUTHORIZED.code);
+      }
+      const isMatch = await bcrypt.compare(password, link.password_hash);
+      if (!isMatch) {
+        throw new AppError('Incorrect password', ERROR_CODES.UNAUTHORIZED.status, ERROR_CODES.UNAUTHORIZED.code);
+      }
+    }
+
+    let file = null;
+    if (link.resource_type === 'file') {
+      const { data: fileData } = await supabase
+        .from('files')
+        .select('*')
+        .eq('id', link.resource_id)
+        .eq('is_deleted', false)
+        .single();
+      file = fileData;
+    } else if (fileId) {
+      const { data: fileData } = await supabase
+        .from('files')
+        .select('*')
+        .eq('id', fileId)
+        .eq('is_deleted', false)
+        .single();
+      file = fileData;
+    }
+
+    if (!file || !file.storage_key) {
+      throw new AppError('File content not found', ERROR_CODES.NOT_FOUND.status, ERROR_CODES.NOT_FOUND.code);
+    }
+
+    if (!file.storage_key.startsWith('tg:')) {
+      throw new AppError('File was uploaded with legacy storage engine and is no longer available', ERROR_CODES.BAD_REQUEST.status, ERROR_CODES.BAD_REQUEST.code);
+    }
+
+    const parts = file.storage_key.split(':');
+    const telegramFileId = parts[1];
+
+    const { response } = await getTelegramFileStream(telegramFileId);
+
+    const isDownload = req.query.download === 'true' || req.query.attachment === 'true';
+    const dispositionType = isDownload ? 'attachment' : 'inline';
+
+    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
+    if (file.size_bytes) res.setHeader('Content-Length', file.size_bytes);
+    res.setHeader('Content-Disposition', `${dispositionType}; filename="${encodeURIComponent(file.name)}"`);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+
+    const nodeStream = Readable.fromWeb(response.body);
+    nodeStream.pipe(res);
   } catch (error) {
     next(error);
   }
