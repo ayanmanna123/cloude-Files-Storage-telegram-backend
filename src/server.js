@@ -31,11 +31,7 @@ initCronJobs();
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
-  'https://cloud-based-media-files-storage-fro.vercel.app',
-  'https://cloud-based-media-files-storage-frontend.ayanmanna858.workers.dev',
-  'https://cloud-box-cloud-storage.vercel.app',
-  'https://cloudbox-cloud-storage.ayanmanna858.workers.dev'
-
+  'https://cloude-files-storage-telegram-front.vercel.app'
 ];
 
 if (process.env.FRONTEND_URL) {

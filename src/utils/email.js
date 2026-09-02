@@ -41,7 +41,7 @@ const getFrontendUrl = (reqOrUrl) => {
   }
 
   return process.env.NODE_ENV === 'production' 
-    ? 'https://cloudbox-cloud-storage.ayanmanna858.workers.dev' 
+    ? 'https://cloude-files-storage-telegram-front.vercel.app' 
     : 'http://localhost:5173';
 };
 
